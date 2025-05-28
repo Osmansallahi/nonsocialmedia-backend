@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 import os
 import uuid
 from PIL import Image
+import base64
+import io
 import tempfile
 
 # Load environment variables
@@ -25,39 +27,45 @@ else:
     from config import DevelopmentConfig
     app.config.from_object(DevelopmentConfig)
 
-# File upload configuration
-UPLOAD_FOLDER = app.config.get('UPLOAD_FOLDER', os.path.join(os.path.dirname(__file__), 'uploads', 'profile_pictures'))
+# File upload configuration (for validation only)
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-MAX_FILE_SIZE = app.config.get('MAX_CONTENT_LENGTH', 5 * 1024 * 1024)  # 5MB
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 
-# Create upload directory if it doesn't exist
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def resize_image(image_path, max_size=(300, 300)):
-    """Resize image to maximum dimensions while maintaining aspect ratio"""
+def resize_image_to_base64(file, max_size=(300, 300)):
+    """Process uploaded image and convert to base64"""
     try:
-        with Image.open(image_path) as img:
-            # Convert RGBA to RGB if necessary
-            if img.mode == 'RGBA':
-                # Create a white background
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
-                img = background
-            
-            # Resize maintaining aspect ratio
-            img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            
-            # Save the resized image
-            img.save(image_path, 'JPEG', quality=85, optimize=True)
+        # Open the image
+        img = Image.open(file)
+        
+        # Convert RGBA to RGB if necessary
+        if img.mode == 'RGBA':
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Resize maintaining aspect ratio
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        # Save to bytes buffer
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=85, optimize=True)
+        
+        # Encode to base64
+        img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        return f"data:image/jpeg;base64,{img_base64}"
+        
     except Exception as e:
-        print(f"Error resizing image: {e}")
+        print(f"Error processing image: {e}")
+        return None
 
 def get_base_url():
     """Get the base URL for the application"""
@@ -103,7 +111,8 @@ class User(db.Model):
     password_hash = db.Column(db.String(120), nullable=False)
     display_name = db.Column(db.String(100), nullable=False)
     bio = db.Column(db.Text, default='Hello! I just joined this amazing social platform.')
-    profile_picture = db.Column(db.String(255), default='https://images.unsplash.com/photo-1535268647677-300dbf3d78d1?w=150&h=150&fit=crop&crop=face')
+    profile_picture = db.Column(db.Text, default='https://images.unsplash.com/photo-1535268647677-300dbf3d78d1?w=150&h=150&fit=crop&crop=face')
+    profile_picture_data = db.Column(db.Text, nullable=True)  # Base64 encoded image data
     followers_count = db.Column(db.Integer, default=0)
     following_count = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -163,21 +172,15 @@ class PostLike(db.Model):
     # Ensure a user can only like a post once
     __table_args__ = (db.UniqueConstraint('user_id', 'post_id'),)
 
-# Create tables and verify setup
+# Create tables and setup database
 with app.app_context():
     db.create_all()
-    
-    # Verify upload directory on startup
-    if not ensure_upload_directory():
-        print("WARNING: Upload directory not accessible. File uploads may fail.")
-    else:
-        print(f"Upload directory ready: {app.config['UPLOAD_FOLDER']}")
     
     # Print configuration info for debugging
     if app.config.get('DEBUG'):
         print(f"Base URL: {get_base_url()}")
-        print(f"Upload folder: {app.config['UPLOAD_FOLDER']}")
         print(f"Environment: {app.config.get('FLASK_ENV', 'unknown')}")
+        print("Using database storage for profile pictures")
 
 # Authentication Routes
 @app.route('/api/auth/register', methods=['POST'])
@@ -430,23 +433,15 @@ def upload_profile_picture():
         if not allowed_file(file.filename):
             return jsonify({'error': 'File type not allowed'}), 400
         
-        # Ensure upload directory exists and is writable
-        if not ensure_upload_directory():
-            return jsonify({'error': 'Upload directory not accessible'}), 500
+        # Process image and convert to base64
+        base64_image = resize_image_to_base64(file)
         
-        # Secure and save the file
-        filename = f"{current_user_id}.jpg"
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        if not base64_image:
+            return jsonify({'error': 'Failed to process image'}), 400
         
-        # Save the uploaded file
-        file.save(file_path)
-        
-        # Resize the image
-        resize_image(file_path)
-        
-        # Update user's profile picture URL - use full URL for server deployment
-        base_url = get_base_url()
-        user.profile_picture = f"{base_url}/uploads/profile_pictures/{filename}"
+        # Store the base64 data in database
+        user.profile_picture_data = base64_image
+        user.profile_picture = f"/api/auth/profile-picture/{current_user_id}"
         
         db.session.commit()
         
@@ -460,39 +455,52 @@ def upload_profile_picture():
         print(f"Error uploading profile picture: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
-# Serve uploaded files
-@app.route('/uploads/profile_pictures/<filename>', methods=['GET'])
-def serve_profile_picture(filename):
+# Serve profile pictures from database
+@app.route('/api/auth/profile-picture/<user_id>', methods=['GET'])
+def get_profile_picture(user_id):
     try:
-        # Security check - ensure filename is safe
-        filename = secure_filename(filename)
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        user = User.query.get(user_id)
         
-        # Check if file exists
-        if not os.path.exists(file_path):
-            return jsonify({'error': 'File not found'}), 404
+        if not user or not user.profile_picture_data:
+            # Return default image or 404
+            return jsonify({'error': 'Profile picture not found'}), 404
         
-        response = send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+        # Extract base64 data (remove data:image/jpeg;base64, prefix)
+        if user.profile_picture_data.startswith('data:image/jpeg;base64,'):
+            base64_data = user.profile_picture_data.split(',')[1]
+        else:
+            base64_data = user.profile_picture_data
         
-        # Add CORS headers for image serving
+        # Decode base64 to bytes
+        try:
+            image_data = base64.b64decode(base64_data)
+        except Exception as e:
+            print(f"Error decoding base64: {e}")
+            return jsonify({'error': 'Invalid image data'}), 400
+        
+        # Create response with image data
+        from flask import Response
+        response = Response(image_data, mimetype='image/jpeg')
+        
+        # Add CORS headers
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = 'GET'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Cache-Control'] = 'public, max-age=3600'  # Cache for 1 hour
         
         return response
+        
     except Exception as e:
         print(f"Error serving profile picture: {e}")
-        return jsonify({'error': 'File not found'}), 404
+        return jsonify({'error': 'Internal server error'}), 500
 
 # Health check endpoint
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    upload_status = "ok" if ensure_upload_directory() else "error"
     return jsonify({
         'status': 'healthy', 
         'timestamp': datetime.utcnow().isoformat(),
-        'upload_directory': upload_status,
-        'upload_path': app.config['UPLOAD_FOLDER'],
+        'storage_type': 'database',
         'base_url': get_base_url()
     }), 200
 
@@ -504,11 +512,9 @@ def debug_config():
     
     return jsonify({
         'flask_env': app.config.get('FLASK_ENV'),
-        'upload_folder': app.config.get('UPLOAD_FOLDER'),
         'base_url': get_base_url(),
         'max_content_length': app.config.get('MAX_CONTENT_LENGTH'),
-        'upload_directory_exists': os.path.exists(app.config.get('UPLOAD_FOLDER', '')),
-        'upload_directory_writable': ensure_upload_directory()
+        'storage_type': 'database'
     }), 200
 
 # Error handlers
