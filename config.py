@@ -15,6 +15,13 @@ class Config:
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)
     JWT_ALGORITHM = 'HS256'
     
+    # File Upload Configuration
+    UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER') or os.path.join(os.path.dirname(__file__), 'uploads', 'profile_pictures')
+    MAX_CONTENT_LENGTH = 5 * 1024 * 1024  # 5MB
+    
+    # Base URL for file serving
+    BASE_URL = os.environ.get('BASE_URL') or 'http://localhost:5000'
+    
     # CORS Configuration
     CORS_ORIGINS = [
         'http://localhost:3000',
@@ -40,6 +47,16 @@ class ProductionConfig(Config):
     SECRET_KEY = os.environ.get('SECRET_KEY')
     JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL')
+    
+    # Railway-specific configuration
+    # Railway provides PORT environment variable
+    PORT = int(os.environ.get('PORT', 5000))
+    
+    # For Railway deployment, use absolute path for uploads
+    UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER') or '/app/uploads/profile_pictures'
+    
+    # Railway URL
+    BASE_URL = os.environ.get('BASE_URL') or 'https://web-production-7c9d.up.railway.app'
 
 class TestingConfig(Config):
     """Testing configuration"""

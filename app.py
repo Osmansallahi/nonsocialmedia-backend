@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import os
 import uuid
 from PIL import Image
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -25,9 +26,9 @@ else:
     app.config.from_object(DevelopmentConfig)
 
 # File upload configuration
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads', 'profile_pictures')
+UPLOAD_FOLDER = app.config.get('UPLOAD_FOLDER', os.path.join(os.path.dirname(__file__), 'uploads', 'profile_pictures'))
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+MAX_FILE_SIZE = app.config.get('MAX_CONTENT_LENGTH', 5 * 1024 * 1024)  # 5MB
 
 # Create upload directory if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -58,39 +59,34 @@ def resize_image(image_path, max_size=(300, 300)):
     except Exception as e:
         print(f"Error resizing image: {e}")
 
-# File upload configuration
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads', 'profile_pictures')
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+def get_base_url():
+    """Get the base URL for the application"""
+    return app.config.get('BASE_URL', os.environ.get('BASE_URL', 'http://localhost:5000'))
 
-# Create upload directory if it doesn't exist
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
-
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def resize_image(image_path, max_size=(300, 300)):
-    """Resize image to maximum dimensions while maintaining aspect ratio"""
+def ensure_upload_directory():
+    """Ensure upload directory exists and is writable"""
+    upload_dir = app.config['UPLOAD_FOLDER']
     try:
-        with Image.open(image_path) as img:
-            # Convert RGBA to RGB if necessary
-            if img.mode == 'RGBA':
-                # Create a white background
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
-                img = background
-            
-            # Resize maintaining aspect ratio
-            img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            
-            # Save the resized image
-            img.save(image_path, 'JPEG', quality=85, optimize=True)
+        os.makedirs(upload_dir, exist_ok=True)
+        # Test if directory is writable
+        test_file = os.path.join(upload_dir, 'test_write.tmp')
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+        return True
     except Exception as e:
-        print(f"Error resizing image: {e}")
+        print(f"Error creating/accessing upload directory: {e}")
+        # On Railway, if we can't create the upload directory, try a temp directory
+        if os.environ.get('RAILWAY_ENVIRONMENT'):
+            try:
+                temp_dir = tempfile.mkdtemp(prefix='uploads_')
+                app.config['UPLOAD_FOLDER'] = temp_dir
+                print(f"Using temporary upload directory: {temp_dir}")
+                return True
+            except Exception as temp_e:
+                print(f"Failed to create temp directory: {temp_e}")
+                return False
+        return False
 
 # Initialize extensions
 db = SQLAlchemy(app)
@@ -167,9 +163,21 @@ class PostLike(db.Model):
     # Ensure a user can only like a post once
     __table_args__ = (db.UniqueConstraint('user_id', 'post_id'),)
 
-# Create tables
+# Create tables and verify setup
 with app.app_context():
     db.create_all()
+    
+    # Verify upload directory on startup
+    if not ensure_upload_directory():
+        print("WARNING: Upload directory not accessible. File uploads may fail.")
+    else:
+        print(f"Upload directory ready: {app.config['UPLOAD_FOLDER']}")
+    
+    # Print configuration info for debugging
+    if app.config.get('DEBUG'):
+        print(f"Base URL: {get_base_url()}")
+        print(f"Upload folder: {app.config['UPLOAD_FOLDER']}")
+        print(f"Environment: {app.config.get('FLASK_ENV', 'unknown')}")
 
 # Authentication Routes
 @app.route('/api/auth/register', methods=['POST'])
@@ -422,16 +430,23 @@ def upload_profile_picture():
         if not allowed_file(file.filename):
             return jsonify({'error': 'File type not allowed'}), 400
         
+        # Ensure upload directory exists and is writable
+        if not ensure_upload_directory():
+            return jsonify({'error': 'Upload directory not accessible'}), 500
+        
         # Secure and save the file
         filename = f"{current_user_id}.jpg"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # Save the uploaded file
         file.save(file_path)
         
         # Resize the image
         resize_image(file_path)
         
-        # Update user's profile picture URL
-        user.profile_picture = f"/uploads/profile_pictures/{filename}"
+        # Update user's profile picture URL - use full URL for server deployment
+        base_url = get_base_url()
+        user.profile_picture = f"{base_url}/uploads/profile_pictures/{filename}"
         
         db.session.commit()
         
@@ -442,20 +457,59 @@ def upload_profile_picture():
         
     except Exception as e:
         db.session.rollback()
+        print(f"Error uploading profile picture: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 # Serve uploaded files
 @app.route('/uploads/profile_pictures/<filename>', methods=['GET'])
 def serve_profile_picture(filename):
     try:
-        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+        # Security check - ensure filename is safe
+        filename = secure_filename(filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # Check if file exists
+        if not os.path.exists(file_path):
+            return jsonify({'error': 'File not found'}), 404
+        
+        response = send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+        
+        # Add CORS headers for image serving
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        
+        return response
     except Exception as e:
+        print(f"Error serving profile picture: {e}")
         return jsonify({'error': 'File not found'}), 404
 
 # Health check endpoint
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}), 200
+    upload_status = "ok" if ensure_upload_directory() else "error"
+    return jsonify({
+        'status': 'healthy', 
+        'timestamp': datetime.utcnow().isoformat(),
+        'upload_directory': upload_status,
+        'upload_path': app.config['UPLOAD_FOLDER'],
+        'base_url': get_base_url()
+    }), 200
+
+# Debug endpoint (development only)
+@app.route('/api/debug/config', methods=['GET'])
+def debug_config():
+    if app.config.get('FLASK_ENV') != 'development':
+        return jsonify({'error': 'Debug endpoint only available in development'}), 403
+    
+    return jsonify({
+        'flask_env': app.config.get('FLASK_ENV'),
+        'upload_folder': app.config.get('UPLOAD_FOLDER'),
+        'base_url': get_base_url(),
+        'max_content_length': app.config.get('MAX_CONTENT_LENGTH'),
+        'upload_directory_exists': os.path.exists(app.config.get('UPLOAD_FOLDER', '')),
+        'upload_directory_writable': ensure_upload_directory()
+    }), 200
 
 # Error handlers
 @app.errorhandler(404)
